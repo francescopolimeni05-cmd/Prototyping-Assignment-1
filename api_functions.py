@@ -275,15 +275,20 @@ Use REAL place names that actually exist in {city}. Include famous/popular spots
     return {"bars":[],"cafes":[]}
 
 def ai_itinerary(api_key, city, dep, ret, days, tvl, style, interests, food, daily_bud,
-                 attractions=None, restaurants=None, hotels=None, weather=None):
-    ctx = []
-    if attractions:
-        ctx.append("Attractions: " + ", ".join(a.get("name","") for a in attractions[:10] if a.get("name")))
-    if restaurants:
-        ctx.append("Restaurants: " + ", ".join(r.get("name","") for r in restaurants[:8] if r.get("name")))
-    if hotels:
-        ctx.append("Hotels: " + ", ".join(h.get("name","") for h in hotels[:3] if h.get("name")))
-    if weather: ctx.append(f"Weather: {weather}")
+                 attractions=None, restaurants=None, hotels=None, weather=None, enriched_ctx=None):
+    # Use enriched context if provided (includes Google ratings + user selections)
+    if enriched_ctx:
+        ctx_str = enriched_ctx
+    else:
+        ctx = []
+        if isinstance(attractions, list) and attractions:
+            ctx.append("Attractions: " + ", ".join(a.get("name","") for a in attractions[:10] if a.get("name")))
+        if isinstance(restaurants, list) and restaurants:
+            ctx.append("Restaurants: " + ", ".join(r.get("name","") for r in restaurants[:8] if r.get("name")))
+        if isinstance(hotels, list) and hotels:
+            ctx.append("Hotels: " + ", ".join(h.get("name","") for h in hotels[:3] if h.get("name")))
+        if weather: ctx.append(f"Weather: {weather}")
+        ctx_str = "\n".join(ctx)
 
     prompt = f"""Create a detailed day-by-day travel itinerary.
 
@@ -291,15 +296,19 @@ TRIP: {city}, {dep} to {ret} ({days} days), {tvl} travelers
 Style: {style} | Interests: {', '.join(interests)} | Food: {', '.join(food)}
 Daily budget: €{daily_bud:.0f}
 
-{"REAL DATA:" + chr(10) + chr(10).join(ctx) if ctx else ""}
+REAL DATA (with Google ratings and prices):
+{ctx_str}
 
-For EACH day (Day 1 to Day {days}):
-- Day 1 = arrival, last day = departure
-- 🌅 Morning / 🌞 Afternoon / 🌙 Evening with specific REAL places
-- Include restaurant names for meals
-- Estimated costs per activity
-- Transport tips
-- Use the real places above when possible
+IMPORTANT:
+- Use the SELECTED flight and hotel if mentioned above
+- Prioritize restaurants and attractions with higher Google ratings
+- Use the Google price levels (€/€€/€€€) to match the user's budget
+- For EACH day (Day 1 to Day {days}):
+  - Day 1 = arrival, last day = departure
+  - 🌅 Morning / 🌞 Afternoon / 🌙 Evening with specific REAL places from the data above
+  - Include restaurant names with their Google rating for meals
+  - Estimated costs per activity
+  - Transport tips
 
 Write in the user's language (detect from: {', '.join(interests + food)}).
 Use emoji headers. Be specific and practical."""
@@ -313,3 +322,215 @@ Use emoji headers. Be specific and practical."""
         if r.status_code == 200: return r.json()["choices"][0]["message"]["content"]
         return f"Error: {r.json().get('error',{}).get('message','Unknown')}"
     except Exception as e: return f"Error: {e}"
+
+
+# ════════════════════════════════════════
+# CHATBOT — Multi-turn travel assistant
+# ════════════════════════════════════════
+
+def build_trip_context(city, dep, ret, days, tvl, budget, style, interests, food,
+                       flights=None, hotels=None, attractions=None, restaurants=None,
+                       nightlife=None, weather=None, itinerary=None, sel_flight=None, sel_hotel=None):
+    """Build a comprehensive context string from all trip data for the chatbot"""
+    ctx = [f"TRIP: {city}, {dep} to {ret}, {days} days, {tvl} travelers, €{budget} budget, style: {style}"]
+    ctx.append(f"Interests: {', '.join(interests)}  |  Food: {', '.join(food)}")
+    if sel_flight:
+        al = ", ".join(sel_flight.get("out",{}).get("airlines",[])) if sel_flight.get("out") else "?"
+        ctx.append(f"SELECTED FLIGHT: {al}, €{sel_flight.get('price',0):,.0f}")
+    if sel_hotel:
+        ctx.append(f"SELECTED HOTEL: {sel_hotel.get('name','?')}, €{sel_hotel.get('per_night',0):,.0f}/night")
+    if isinstance(flights, list) and flights:
+        prices = [f["price"] for f in flights[:5]]
+        ctx.append(f"FLIGHTS FOUND: {len(flights)} options, prices €{min(prices):,.0f}–€{max(prices):,.0f}")
+    if isinstance(hotels, list) and hotels:
+        ctx.append("HOTELS: " + ", ".join(f"{h.get('name','')} (€{h.get('price_per_night',0)}/n)" for h in hotels[:5]))
+    if isinstance(attractions, list) and attractions:
+        ctx.append("ATTRACTIONS: " + ", ".join(a.get("name","") for a in attractions[:8] if a.get("name")))
+    if isinstance(restaurants, list) and restaurants:
+        ctx.append("RESTAURANTS: " + ", ".join(r.get("name","") for r in restaurants[:8] if r.get("name")))
+    if isinstance(nightlife, dict):
+        bars = nightlife.get("bars",[])
+        if bars: ctx.append("BARS: " + ", ".join(b.get("name","") for b in bars[:5]))
+    if weather: ctx.append(f"WEATHER: {weather}")
+    if itinerary: ctx.append(f"GENERATED ITINERARY:\n{itinerary[:1500]}")
+    return "\n".join(ctx)
+
+def ai_chat(api_key, messages, trip_context):
+    """Multi-turn chatbot with full trip context"""
+    system = f"""You are VoyageAI, a friendly and knowledgeable travel assistant. You have access to all the data about the user's trip:
+
+{trip_context}
+
+Use this data to give specific, personalized answers. Reference real places, prices, and details from the trip data above.
+Be concise but helpful. If the user asks about something not in the data, give your best advice based on your knowledge.
+Respond in the same language the user writes in."""
+
+    try:
+        r = requests.post("https://api.openai.com/v1/chat/completions",
+            headers={"Authorization":f"Bearer {api_key}","Content-Type":"application/json"},
+            json={"model":"gpt-4o-mini",
+                  "messages":[{"role":"system","content":system}] + messages,
+                  "max_tokens":1000,"temperature":0.7}, timeout=30)
+        if r.status_code == 200: return r.json()["choices"][0]["message"]["content"]
+        return f"Error: {r.json().get('error',{}).get('message','Unknown')}"
+    except Exception as e: return f"Error: {e}"
+
+
+# ════════════════════════════════════════
+# BUDGET OPTIMIZER — AI analyzes & suggests savings
+# ════════════════════════════════════════
+
+def ai_budget_optimizer(api_key, city, days, tvl, budget, fl_b, ht_b, fd_b, ac_b,
+                        sel_flight=None, sel_hotel=None, attractions=None, restaurants=None, enriched_ctx=None):
+    """AI analyzes trip data and returns structured savings suggestions"""
+    ctx = [f"Trip: {city}, {days} days, {tvl} travelers, total budget €{budget}"]
+    ctx.append(f"Budget split: Flights €{fl_b}, Hotels €{ht_b}, Food €{fd_b}, Activities €{ac_b}")
+    if sel_flight: ctx.append(f"Selected flight: €{sel_flight.get('price',0):,.0f}")
+    if sel_hotel: ctx.append(f"Selected hotel: {sel_hotel.get('name','?')} €{sel_hotel.get('per_night',0)}/night, total €{sel_hotel.get('total',0)}")
+    if enriched_ctx:
+        ctx.append(f"\nDATA WITH GOOGLE RATINGS AND PRICES:\n{enriched_ctx}")
+    else:
+        if isinstance(attractions, list) and attractions:
+            free = [a for a in attractions if a.get("free")]
+            paid = [a for a in attractions if not a.get("free")]
+            ctx.append(f"Attractions: {len(free)} free, {len(paid)} paid")
+        if isinstance(restaurants, list) and restaurants:
+            ctx.append("Restaurants: " + ", ".join(f"{r.get('name','')} ({r.get('price_range','')})" for r in restaurants[:6]))
+
+    prompt = f"""Analyze this trip and provide budget optimization advice.
+
+{chr(10).join(ctx)}
+
+Return a JSON object with:
+{{
+  "summary": "2-sentence overview of budget health",
+  "score": number 1-10 (10=perfectly optimized),
+  "total_potential_savings": number in EUR,
+  "tips": [
+    {{"category": "flights/hotels/food/activities/transport/general", "tip": "specific actionable advice", "potential_savings": number in EUR, "priority": "high/medium/low"}}
+  ],
+  "daily_budget_breakdown": {{
+    "breakfast": number, "lunch": number, "dinner": number, "transport": number, "activities": number, "misc": number
+  }},
+  "money_saving_alternatives": [
+    {{"original": "expensive option", "alternative": "cheaper option", "savings": number}}
+  ]
+}}
+
+Give 5-8 specific tips. Be realistic with savings estimates for {city}. Use real knowledge of local prices."""
+
+    data = _oai(api_key, prompt)
+    if isinstance(data, str) and data.startswith("_ERR_"): return data
+    if isinstance(data, dict): return data
+    return {"summary":"Could not analyze budget.","score":5,"tips":[],"total_potential_savings":0,
+            "daily_budget_breakdown":{},"money_saving_alternatives":[]}
+
+
+# ════════════════════════════════════════
+# TIKTOK — AI-powered travel content discovery
+# ════════════════════════════════════════
+
+def ai_tiktok_recs(api_key, city, interests):
+    """AI generates TikTok search queries and creator recommendations for a destination"""
+    ints = ", ".join(interests) if interests else "travel, food, culture"
+    prompt = f"""You are a travel content expert who knows TikTok very well.
+For someone traveling to {city} with interests in {ints}, suggest TikTok content to watch before the trip.
+
+Return a JSON object:
+{{
+  "search_queries": ["5-8 specific TikTok search terms that will find the best travel content for {city}, e.g. '{city} hidden gems', '{city} food guide 2025'"],
+  "creator_recommendations": [
+    {{"username": "@realusername", "description": "what they post about", "why": "why relevant for this trip"}}
+  ],
+  "trending_topics": ["3-5 trending travel topics related to {city} on TikTok"],
+  "video_ideas": [
+    {{"title": "video topic title", "search_term": "exact tiktok search query", "category": "food/culture/nightlife/hidden gems/budget tips/photography spots"}}
+  ]
+}}
+
+Give 4-6 real TikTok creators who actually post about {city} or travel in that region. Give 6-8 video ideas.
+Use REAL creator usernames when possible."""
+
+    data = _oai(api_key, prompt)
+    if isinstance(data, str) and data.startswith("_ERR_"): return data
+    if isinstance(data, dict): return data
+    return {"search_queries":[],"creator_recommendations":[],"trending_topics":[],"video_ideas":[]}
+
+
+# ════════════════════════════════════════
+# EXCHANGE RATE — frankfurter.app (free, no key)
+# ════════════════════════════════════════
+
+def get_exchange_rates(base="EUR"):
+    """Get current exchange rates from frankfurter.app"""
+    try:
+        r = requests.get(f"https://api.frankfurter.app/latest?from={base}", timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            return {"base": data.get("base","EUR"), "date": data.get("date",""), "rates": data.get("rates",{})}
+    except: pass
+    return None
+
+def get_currency_for_city(api_key, city):
+    """Use OpenAI to determine the local currency for a city"""
+    prompt = f'What is the official currency used in {city}? Return JSON: {{"currency_code":"XXX","currency_name":"...","symbol":"..."}}'
+    data = _oai(api_key, prompt)
+    if isinstance(data, dict): return data
+    return {"currency_code":"USD","currency_name":"US Dollar","symbol":"$"}
+
+
+# ════════════════════════════════════════
+# GOOGLE DIRECTIONS — transit/driving time between places
+# ════════════════════════════════════════
+
+def get_directions(origin, destination, key, mode="transit"):
+    """Get directions between two places using Google Directions API"""
+    try:
+        r = requests.get("https://maps.googleapis.com/maps/api/directions/json",
+            params={"origin":origin,"destination":destination,"mode":mode,"key":key}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("routes"):
+                leg = data["routes"][0]["legs"][0]
+                return {
+                    "duration": leg.get("duration",{}).get("text",""),
+                    "duration_sec": leg.get("duration",{}).get("value",0),
+                    "distance": leg.get("distance",{}).get("text",""),
+                    "distance_m": leg.get("distance",{}).get("value",0),
+                    "start": leg.get("start_address",""),
+                    "end": leg.get("end_address",""),
+                    "steps": [{"instruction":s.get("html_instructions",""),"duration":s.get("duration",{}).get("text",""),"mode":s.get("travel_mode","")} for s in leg.get("steps",[])[:8]]
+                }
+    except: pass
+    return None
+
+
+# ════════════════════════════════════════
+# PACKING LIST — AI generates based on weather + activities
+# ════════════════════════════════════════
+
+def ai_packing_list(api_key, city, days, weather, interests, style):
+    """Generate smart packing list based on weather forecast and planned activities"""
+    prompt = f"""Create a detailed packing list for a trip to {city} ({days} days).
+
+Weather forecast: {weather if weather else 'not available'}
+Activities/interests: {', '.join(interests) if interests else 'general sightseeing'}
+Travel style: {style}
+
+Return a JSON object:
+{{
+  "essentials": [{{"item":"...","reason":"why needed","priority":"must/recommended/optional"}}],
+  "clothing": [{{"item":"...","quantity":number,"reason":"based on weather/activity"}}],
+  "tech": [{{"item":"...","reason":"..."}}],
+  "health": [{{"item":"...","reason":"..."}}],
+  "documents": [{{"item":"...","reason":"..."}}],
+  "tips": ["3-4 packing tips specific to {city}"],
+  "weather_advisory": "1-2 sentences about what to expect weather-wise and how it affects packing"
+}}
+
+Be specific to {city} and the weather. For example if it rains, include umbrella. If hot, include sunscreen. If visiting churches, mention dress code."""
+
+    data = _oai(api_key, prompt)
+    if isinstance(data, str) and data.startswith("_ERR_"): return data
+    if isinstance(data, dict): return data
+    return {"essentials":[],"clothing":[],"tech":[],"health":[],"documents":[],"tips":[],"weather_advisory":""}
