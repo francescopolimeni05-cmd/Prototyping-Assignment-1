@@ -15,6 +15,7 @@ from ui_widgets import (
     render_sources,
     render_structured_itinerary,
     render_agent_trace,
+    _clean_md,
 )
 
 st.set_page_config(page_title="VoyageAI", page_icon="✈️", layout="wide", initial_sidebar_state="expanded")
@@ -330,6 +331,9 @@ def load_all():
     if "flights_data" not in st.session_state and amadeus_token:
         raw=search_flights(amadeus_token,oc,dc,dep.strftime("%Y-%m-%d"),ret.strftime("%Y-%m-%d"),tvl)
         st.session_state.flights_data=[] if (isinstance(raw,dict) and "_error" in raw) else parse_flights(raw)
+        # Track whether the results came from the Amadeus mock fallback so the
+        # UI can surface a banner ("API down — simulated flights").
+        st.session_state.flights_source="mock" if isinstance(raw,dict) and raw.get("_mock") else "amadeus"
     # Hotels
     if "hotels_data" not in st.session_state and OAIKEY:
         st.session_state.hotels_data=ai_hotels(OAIKEY,dcity,accom,trip_days,dht)
@@ -378,6 +382,8 @@ with tabs[0]:
     if not amadeus_token: st.info("🔑 Add AMADEUS keys")
     else:
         flights=st.session_state.get("flights_data",[])
+        if st.session_state.get("flights_source")=="mock":
+            st.warning("⚠️ **Amadeus API is temporarily unavailable** — showing simulated flights for demo purposes. Prices and airlines are indicative.")
         if flights:
             st.success(f"**{len(flights)}** flights found")
             c1,c2=st.columns(2)
@@ -632,7 +638,7 @@ with tabs[6]:
                     enriched_ctx=enriched_ctx)
             st.session_state["ai_itinerary"]=it
         if "ai_itinerary" in st.session_state:
-            st.markdown("---"); st.markdown(st.session_state["ai_itinerary"])
+            st.markdown("---"); st.markdown(_clean_md(st.session_state["ai_itinerary"]))
             if st.button("🔄 Regenerate"): del st.session_state["ai_itinerary"]; st.rerun()
             st.download_button("📥 Download Itinerary",data=st.session_state["ai_itinerary"],
                 file_name=f"itinerary_{dcity}.md",mime="text/markdown",use_container_width=True)
@@ -811,14 +817,35 @@ with tabs[7]:
 
         # Quick question suggestions
         if not st.session_state.chat_messages:
-            st.markdown("**💡 Try asking:**")
-            suggestions = [
-                f"What are the must-see places in {dcity}?",
-                "How should I split my daily budget?",
-                f"What's the best way to get around {dcity}?",
-                "Any tips for saving money on food?",
-                "What should I pack based on the weather?"
-            ]
+            if use_rag:
+                # RAG-specific questions: these are designed to hit the travel
+                # knowledge base and return citations. They're deliberately
+                # narrower and more factual than the generic ones.
+                st.markdown(
+                    "**📚 RAG-powered examples**  \n"
+                    "<span style='color:#6b6b6b;font-size:.85rem'>"
+                    "These queries pull from a curated Wikipedia travel knowledge base "
+                    "(40 cities, 1800+ chunks) and cite sources."
+                    "</span>",
+                    unsafe_allow_html=True,
+                )
+                suggestions = [
+                    f"What are common tourist scams to avoid in {dcity}?",
+                    f"What are the best neighborhoods to stay in {dcity}?",
+                    f"What local etiquette and customs should I know about in {dcity}?",
+                    f"How does public transport work in {dcity}?",
+                    f"What is {dcity} historically famous for?",
+                    f"What safety precautions should tourists take in {dcity}?",
+                ]
+            else:
+                st.markdown("**💡 Try asking:**")
+                suggestions = [
+                    f"What are the must-see places in {dcity}?",
+                    "How should I split my daily budget?",
+                    f"What's the best way to get around {dcity}?",
+                    "Any tips for saving money on food?",
+                    "What should I pack based on the weather?",
+                ]
             cols = st.columns(2)
             for i, sug in enumerate(suggestions):
                 with cols[i % 2]:
@@ -1248,17 +1275,27 @@ with tabs[13]:
         if result and result.get("_error"):
             st.error(f"Agent error: {result['_error']}")
         elif result:
+            # If the agent's search_flights step came from the mock generator,
+            # surface a banner so users know why airlines/prices are synthetic.
+            steps = result.get("steps") or []
+            flight_mock = any(
+                s.get("tool") == "search_flights"
+                and '"source": "mock"' in (s.get("output_summary") or "")
+                for s in steps
+            )
+            if flight_mock:
+                st.warning("⚠️ **Amadeus API is temporarily unavailable** — flight results in this plan are simulated.")
+
             final_message = result.get("final_message")
             if final_message:
                 st.markdown("#### 📝 Agent summary")
-                st.markdown(final_message)
+                st.markdown(_clean_md(final_message))
 
             final_plan = result.get("final_plan")
             if final_plan:
                 st.markdown("#### 🗂️ Proposed plan")
                 render_structured_itinerary(final_plan, key_suffix="agent")
 
-            steps = result.get("steps") or []
             render_agent_trace(steps)
 
             st.markdown("---")

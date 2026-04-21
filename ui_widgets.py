@@ -13,11 +13,33 @@ Design notes:
 """
 from __future__ import annotations
 
+import re
 from typing import Any, Callable
 
 import streamlit as st
 
 import backend_client as api
+
+
+_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _clean_md(text: str | None) -> str:
+    """
+    Strip hallucinated markdown links that point to non-URLs.
+
+    LLMs sometimes emit `[The Louvre](The Louvre)` which Streamlit renders as
+    a relative anchor — clicking it reloads the page uselessly. We keep genuine
+    URLs (http/https/mailto) and strip the rest back to the label text.
+    """
+    if not text:
+        return ""
+    def _repl(m: re.Match) -> str:
+        label, url = m.group(1), m.group(2).strip()
+        if url.startswith(("http://", "https://", "mailto:")):
+            return m.group(0)
+        return label
+    return _LINK_RE.sub(_repl, text)
 
 
 # ── Voting: AI vs Manual (the prof's explicit ask) ────────────────────────
@@ -191,9 +213,9 @@ def render_structured_itinerary(
                 label = label_raw.title() or "•"
                 emoji = {"Morning": "🌅", "Afternoon": "☀️", "Evening": "🌙"}.get(label, "•")
                 st.markdown(f"**{emoji} {label}**")
-                activity = block.get("activity") or ""
+                activity = _clean_md(block.get("activity"))
                 st.markdown(activity)
-                loc = block.get("location")
+                loc = _clean_md(block.get("location"))
                 if loc:
                     st.caption(f"📍 {loc}")
                 cost = block.get("estimated_cost_eur")
@@ -205,7 +227,7 @@ def render_structured_itinerary(
                     meta_bits.append(f"🚶 {travel} min")
                 if meta_bits:
                     st.caption(" · ".join(meta_bits))
-                notes = block.get("notes") or block.get("tip")
+                notes = _clean_md(block.get("notes") or block.get("tip"))
                 if notes:
                     st.caption(f"💡 {notes}")
                 st.markdown("")

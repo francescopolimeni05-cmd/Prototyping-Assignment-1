@@ -22,6 +22,8 @@ Rules:
 - Prefer places that appear in the enriched_context (they have Google ratings/prices).
 - Day 1 is arrival, last day is departure — keep activities lighter on those.
 - Use the weather summary to avoid outdoor plans on rainy days.
+- All string fields (activity, location, notes) must be PLAIN TEXT — no
+  markdown links `[x](y)`, no URLs, no hyperlinks of any kind.
 - Respond with JSON only, no prose outside the JSON."""
 
 SCHEMA_HINT = """{

@@ -484,6 +484,11 @@ IMPORTANT:
   - Estimated costs per activity
   - Transport tips
 
+FORMATTING RULES (STRICT):
+- Write place names as PLAIN TEXT only — no markdown links, no URLs, no hyperlinks.
+- Do NOT use [name](url) syntax anywhere. Do NOT include http:// or https://.
+- Do NOT write "click here" or similar phrases.
+
 Write in the user's language (detect from: {', '.join(interests + food)}).
 Use emoji headers. Be specific and practical."""
 
