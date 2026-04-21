@@ -227,20 +227,32 @@ TOOL_SCHEMAS = [
 
 AGENT_SYSTEM = """You are VoyageAI's autonomous trip planner.
 
-Given a user's freeform goal, plan what tools to call, gather data, then
-compose a final multi-day itinerary. You may call tools multiple times.
-When done, ALWAYS end by calling `compose_itinerary` with all the data you
-have gathered, then reply with a short summary message.
+Your job is to read the user's freeform goal, call a FEW tools to gather
+context, then call `compose_itinerary` EXACTLY ONCE at the end to produce
+the final plan. You MUST finish by calling `compose_itinerary` — the UI
+shows nothing if you don't.
 
-Guidelines:
-- Start by extracting: destination, dates (assume next available weekend if
-  unspecified), number of days, travelers, budget, style, interests, food
-  preferences. Ask the LLM only if absolutely necessary; otherwise infer
-  reasonable defaults.
-- Call `get_weather` early to inform the plan.
-- Always call `compose_itinerary` last with a rich `enriched_context`
-  string built from the other tool outputs.
-- Keep total tool calls <= 6.
+STRICT BUDGET: at most 5 tool calls before `compose_itinerary`. Then one
+call to `compose_itinerary`. That's it.
+
+Suggested order:
+  1. `get_weather` for the destination city
+  2. `search_hotels` or `search_attractions` (pick one or two — not both if
+     you're short on budget)
+  3. `compose_itinerary` with everything you have
+
+Rules:
+- NEVER retry a tool that returned count:0 or error. Move on.
+- For `search_flights`, pass IATA codes (e.g. "FCO", "JFK"), never city
+  names. If you don't know the IATA code for the origin, SKIP flights —
+  do not guess.
+- When you call `compose_itinerary`, infer reasonable defaults from the
+  goal: number of days, travelers, budget (eur/day), style (Balanced,
+  Luxury, Adventure, Relaxed), interests list, food prefs list.
+- Dates: if unspecified, assume a 7-day trip starting 30 days from today.
+- Build `enriched_context` by concatenating the short tool outputs you've
+  seen (hotels, restaurants, attractions).
+- Keep the final user-facing message to ONE sentence.
 """
 
 
@@ -255,12 +267,28 @@ def run_agent(req: AgentPlanRequest, max_steps: int = 8) -> AgentPlanResponse:
     final_plan: StructuredItinerary | None = None
     final_message = ""
 
-    for _ in range(max_steps):
+    for step_i in range(max_steps):
+        # On the very last iteration, force the model to call compose_itinerary
+        # so we never exit the loop without a plan.
+        is_last = step_i == max_steps - 1
+        if is_last and final_plan is None:
+            tool_choice: Any = {"type": "function", "function": {"name": "compose_itinerary"}}
+            messages.append({
+                "role": "system",
+                "content": (
+                    "This is your LAST step. You MUST call compose_itinerary now "
+                    "with the best data you have. Infer any missing fields from the "
+                    "user goal and tool outputs above."
+                ),
+            })
+        else:
+            tool_choice = "auto"
+
         resp = openai_client().chat.completions.create(
             model=config.CHAT_MODEL,
             messages=messages,
             tools=TOOL_SCHEMAS,
-            tool_choice="auto",
+            tool_choice=tool_choice,
             temperature=0.3,
         )
         msg = resp.choices[0].message
@@ -317,7 +345,75 @@ def run_agent(req: AgentPlanRequest, max_steps: int = 8) -> AgentPlanResponse:
                 "name": name,
                 "content": json.dumps(output)[:6000],  # cap tool output size
             })
-    else:
-        final_message = final_message or "Agent reached max steps without finalising."
+
+        # If the model has now produced a plan, end the loop early — no
+        # point continuing to burn tokens.
+        if final_plan is not None:
+            final_message = final_message or "Itinerary composed successfully."
+            break
+
+    # Safety net: if we still have no plan (e.g. the forced last step returned
+    # unparseable JSON), synthesise one directly so the UI always shows
+    # something usable.
+    if final_plan is None:
+        final_plan = _force_compose_from_goal(req.goal)
+        if final_plan is not None:
+            final_message = final_message or "Plan generated via safety fallback."
+
+    if not final_message:
+        final_message = "Agent finished."
 
     return AgentPlanResponse(steps=steps, final_plan=final_plan, final_message=final_message)
+
+
+def _force_compose_from_goal(goal: str) -> StructuredItinerary | None:
+    """
+    Last-resort fallback: derive minimal ItineraryGenerateRequest params from
+    the raw goal via a quick structured LLM call, then compose directly.
+    """
+    import datetime as _dt
+    extract_prompt = f"""Extract trip parameters from this goal. Respond with JSON only.
+Goal: "{goal}"
+
+Schema:
+{{
+  "destination": "city name (string)",
+  "days": integer (default 5),
+  "travelers": integer (default 2),
+  "style": "Balanced|Luxury|Adventure|Relaxed" (default "Balanced"),
+  "interests": ["Culture","Food","Nature","Nightlife","Shopping"] subset,
+  "food_prefs": list of strings (default []),
+  "daily_budget": number EUR (default 150)
+}}"""
+    try:
+        from .openai_client import chat_json
+        params = chat_json(
+            [{"role": "user", "content": extract_prompt}],
+            max_tokens=400,
+            temperature=0.1,
+        )
+    except Exception:
+        return None
+
+    today = _dt.date.today()
+    depart = today + _dt.timedelta(days=30)
+    days = int(params.get("days") or 5)
+    ret = depart + _dt.timedelta(days=days)
+
+    try:
+        req = ItineraryGenerateRequest(
+            destination=str(params.get("destination") or "Paris"),
+            depart_date=depart.isoformat(),
+            return_date=ret.isoformat(),
+            days=days,
+            travelers=int(params.get("travelers") or 2),
+            style=str(params.get("style") or "Balanced"),
+            interests=list(params.get("interests") or ["Culture", "Food"]),
+            food_prefs=list(params.get("food_prefs") or []),
+            daily_budget=float(params.get("daily_budget") or 150),
+            enriched_context="",
+            weather_summary="",
+        )
+        return generate_structured(req)
+    except Exception:
+        return None
