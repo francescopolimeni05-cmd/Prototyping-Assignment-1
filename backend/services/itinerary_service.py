@@ -13,6 +13,10 @@ from .openai_client import chat_json
 SYSTEM = """You generate detailed, practical multi-day travel itineraries as strict JSON.
 Rules:
 - Always produce exactly `days` entries, numbered 1..days.
+- `days` MUST be a JSON array where each element is an object with these exact
+  keys at the top level: `day_n` (integer), `title` (string), `blocks` (array).
+- Do NOT wrap days as `{"day_1": {...}, "day_2": {...}}` — each element must
+  have `day_n` as a field, not as a key.
 - Each day has a title and three blocks: morning, afternoon, evening.
 - Each block has: activity (what to do), location (specific place), travel_minutes (int, from previous block), estimated_cost_eur (float), notes (optional logistics).
 - Prefer places that appear in the enriched_context (they have Google ratings/prices).
@@ -66,9 +70,61 @@ Return JSON matching this schema:
         if isinstance(inner, dict) and "days" in inner:
             data = inner
 
+    # Normalise day shapes — LLM sometimes returns one of:
+    #   a) list[{"day_n": 1, "title": ..., "blocks": ...}]   (correct)
+    #   b) list[{"day_1": {"title": ..., "blocks": ...}}]    (wrapped per-day)
+    #   c) {"day_1": {...}, "day_2": {...}}                  (dict-of-days)
+    data["days"] = _normalise_days(data.get("days"))
+
     # Ensure destination field present for the Pydantic model.
     data.setdefault("destination", req.destination)
     return StructuredItinerary.model_validate(data)
+
+
+def _normalise_days(raw: object) -> list[dict]:
+    """Coerce various LLM day-list shapes into the canonical form."""
+    if raw is None:
+        return []
+
+    # Case c: dict with day_N keys → turn into list preserving order.
+    if isinstance(raw, dict):
+        items = sorted(raw.items(), key=lambda kv: _day_key_num(kv[0]))
+        raw = [{k: v} for k, v in items]
+
+    if not isinstance(raw, list):
+        return []
+
+    normalised: list[dict] = []
+    for i, entry in enumerate(raw, start=1):
+        if not isinstance(entry, dict):
+            continue
+
+        # Case a: already has day_n/title/blocks at top level.
+        if "blocks" in entry or "title" in entry or "day_n" in entry:
+            entry.setdefault("day_n", i)
+            normalised.append(entry)
+            continue
+
+        # Case b: single key like "day_1" wrapping the real payload.
+        if len(entry) == 1:
+            key, inner = next(iter(entry.items()))
+            if isinstance(inner, dict):
+                inner = dict(inner)  # copy to avoid mutating caller data
+                inner.setdefault("day_n", _day_key_num(key) or i)
+                normalised.append(inner)
+                continue
+
+        # Unknown shape — best effort: keep the raw dict, stamp day_n.
+        entry.setdefault("day_n", i)
+        normalised.append(entry)
+
+    return normalised
+
+
+def _day_key_num(key: str) -> int:
+    """Extract the trailing integer from strings like 'day_3' or 'Day 3'."""
+    digits = "".join(ch for ch in str(key) if ch.isdigit())
+    return int(digits) if digits else 0
 
 
 def regen_day(
