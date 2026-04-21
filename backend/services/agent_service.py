@@ -38,12 +38,16 @@ import api_functions as af  # type: ignore
 # ── Tool implementations ───────────────────────────────────────────────────
 
 def _tool_search_flights(origin_iata: str, destination_iata: str, depart: str, ret: str, adults: int = 1) -> dict:
-    tok = af.get_amadeus_token(config.AMADEUS_CLIENT_ID, config.AMADEUS_CLIENT_SECRET)
-    if not tok:
-        return {"error": "Amadeus auth failed"}
+    # Best effort: if auth fails, pass a bad token — search_flights has a
+    # built-in mock fallback that activates when Amadeus is unreachable.
+    tok = af.get_amadeus_token(config.AMADEUS_CLIENT_ID, config.AMADEUS_CLIENT_SECRET) or ""
     raw = af.search_flights(tok, origin_iata, destination_iata, depart, ret, adults)
     flights = af.parse_flights(raw) if not (isinstance(raw, dict) and "_error" in raw) else []
-    return {"count": len(flights), "cheapest": flights[0] if flights else None}
+    return {
+        "count": len(flights),
+        "cheapest": flights[0] if flights else None,
+        "source": "mock" if isinstance(raw, dict) and raw.get("_mock") else "amadeus",
+    }
 
 
 def _tool_search_hotels(city: str, nights: int, budget_per_night: float) -> dict:
