@@ -1241,14 +1241,20 @@ with tabs[13]:
         )
     else:
         default_goal = (
-            f"Plan a {trip_days}-day trip to {dcity} for {tvl} travelers on a "
-            f"€{bud} budget, style {style}, interests: {', '.join(interests)}."
+            f"Plan a {trip_days}-day trip from {ocity} to {dcity} "
+            f"(depart {dep}, return {ret}) for {tvl} travelers on a €{bud} "
+            f"budget, style {style}, interests: {', '.join(interests)}, "
+            f"food preferences: {', '.join(food_prefs)}."
         )
+        # Key includes trip params so the textarea resets when the user
+        # changes origin/destination/dates in the sidebar (otherwise
+        # Streamlit would keep the stale cached goal).
+        goal_key = f"agent_goal_{ocity}_{dcity}_{dep}_{ret}_{trip_days}"
         goal = st.text_area(
             "🎯 Your goal",
             value=default_goal,
             height=100,
-            key="agent_goal",
+            key=goal_key,
             help="The agent will call 1–8 tools to satisfy this goal.",
         )
         col_run, col_clear = st.columns([3, 1])
