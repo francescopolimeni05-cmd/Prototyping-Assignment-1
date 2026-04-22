@@ -7,9 +7,20 @@ Resilience: Amadeus TEST sometimes returns HTTP 500 (internal error). Both
 app keeps working even if Amadeus is down. Users see a small "cached data"
 caption but the UX never breaks.
 """
+import os
 import random
 import datetime as _dt
 import requests, json
+
+# The Amadeus *TEST* sandbox frequently returns fictional carriers, odd
+# routings and garbage prices (e.g. Delta operating FCO→BCN for €900 in
+# economy). For the live student demo we want deterministic, realistic
+# carriers/prices — so by default we skip the Amadeus TEST call entirely
+# and serve the route-aware mock below.
+#
+# Flip this to "1" (env or secrets) once a real Amadeus PRODUCTION key is
+# wired up and you actually want live offers.
+USE_AMADEUS_LIVE = os.environ.get("USE_AMADEUS_LIVE", "0") == "1"
 
 # ════════════════════════════════════════
 # AMADEUS — Flights
@@ -114,6 +125,12 @@ def search_airports(kw, token):
     return _fallback_airport_search(kw)
 
 def search_flights(token, orig, dest, dep, ret, adults):
+    # Skip the TEST sandbox unless explicitly opted in — its offers are
+    # consistently unrealistic and confused our users. Mock offers are
+    # route-aware and look like real Amadeus responses.
+    if not USE_AMADEUS_LIVE:
+        return _mock_flight_response(orig, dest, dep, ret, adults)
+
     all_offers = {}
     params = {"originLocationCode":orig,"destinationLocationCode":dest,
               "departureDate":dep,"returnDate":ret,"adults":adults,
@@ -243,6 +260,10 @@ _DEFAULT_CARRIERS: list[tuple[str, str]] = [
     ("TK", "Turkish Airlines"), ("QR", "Qatar Airways"),
 ]
 
+# Low-cost carriers that don't sell Premium/Business — used to keep the
+# mock offer mix realistic (no "Ryanair Business" nonsense).
+_LOW_COST_CARRIERS = {"FR", "U2", "W6", "VY", "WN", "B6"}
+
 
 def _carriers_for_route(orig: str, dest: str) -> list[tuple[str, str]]:
     """Realistic pool of carriers that would plausibly fly orig → dest."""
@@ -274,10 +295,29 @@ def _iso_dur(minutes: int) -> str:
 
 
 def _mock_flight_response(orig: str, dest: str, dep: str, ret: str, adults: int) -> dict:
-    """Build an Amadeus-shaped response with 6 plausible offers (mixed cabins)."""
+    """Build an Amadeus-shaped response with plausible offers (mixed cabins).
+
+    Pricing model (one-way, per adult, economy baseline):
+      base = short_haul_floor + km * €/km
+    Then multiplied by 2 for round trip and by adults, and by a cabin
+    multiplier. Calibrated so FCO→BCN lands ~€90-150 economy, ~€400
+    business — in line with what a user would see on Skyscanner.
+    """
     rng = random.Random(f"{orig}-{dest}-{dep}")  # deterministic per route/date
     km = _rough_distance_km(orig, dest)
-    base = 60 + km * 0.055  # EUR per leg, roughly
+
+    # Two-tier pricing: Europe short-haul is almost flat (low-cost market),
+    # long-haul scales linearly with distance.
+    zo, zd = _zone_of(orig), _zone_of(dest)
+    if zo == zd == "Europe":
+        # ~€30-90 one-way economy for typical 500-2500 km routes.
+        base = 30 + km * 0.025
+    elif zo == zd == "NA":
+        base = 80 + km * 0.035
+    else:
+        # Long-haul: flatter per-km so ultra-long (17000 km) stays reasonable.
+        base = 200 + km * 0.045
+
     dur_min = int(90 + km / 13)  # crude flight time
 
     # Pick only carriers that actually fly this zone pair (e.g. Vueling
@@ -287,10 +327,25 @@ def _mock_flight_response(orig: str, dest: str, dep: str, ret: str, adults: int)
     k = min(5, len(route_carriers))
     carriers_pool = [c for c, _ in rng.sample(route_carriers, k=k)]
     carrier_names = {c: n for c, n in route_carriers if c in carriers_pool}
-    offers = []
-    # Cabin price multipliers
-    cabins = [("ECONOMY", 1.0), ("ECONOMY", 1.15), ("ECONOMY", 1.3),
-              ("PREMIUM_ECONOMY", 1.9), ("BUSINESS", 3.2), ("BUSINESS", 3.8)]
+
+    # Split the pool: low-cost carriers only get ECONOMY offers; full-
+    # service carriers are eligible for Premium/Business as well.
+    lowcost_pool = [c for c in carriers_pool if c in _LOW_COST_CARRIERS]
+    fullservice_pool = [c for c in carriers_pool if c not in _LOW_COST_CARRIERS]
+    # If the route is dominated by low-cost (e.g. Europe short-haul with no
+    # legacy carrier drawn), fall back to the whole pool for upper cabins.
+    if not fullservice_pool:
+        fullservice_pool = carriers_pool
+
+    # (cabin, price multiplier, eligible-pool)
+    offer_specs = [
+        ("ECONOMY",          0.95, lowcost_pool or carriers_pool),
+        ("ECONOMY",          1.10, carriers_pool),
+        ("ECONOMY",          1.30, carriers_pool),
+        ("PREMIUM_ECONOMY",  1.90, fullservice_pool),
+        ("BUSINESS",         3.20, fullservice_pool),
+        ("BUSINESS",         3.80, fullservice_pool),
+    ]
 
     def _leg(carrier: str, date: str, dep_hour: int, dur: int) -> dict:
         # Single-segment itinerary (non-stop) for simplicity.
@@ -307,8 +362,11 @@ def _mock_flight_response(orig: str, dest: str, dep: str, ret: str, adults: int)
             }],
         }
 
-    for i, (cabin, mult) in enumerate(cabins):
-        carrier = carriers_pool[i % len(carriers_pool)]
+    offers = []
+    for i, (cabin, mult, pool) in enumerate(offer_specs):
+        if not pool:
+            continue
+        carrier = pool[i % len(pool)]
         price = round(base * mult * adults * 2, 2)  # round trip * pax
         out = _leg(carrier, dep, 6 + i * 3, int(dur_min * rng.uniform(0.95, 1.1)))
         ret_leg = _leg(carrier, ret, 9 + i * 2, int(dur_min * rng.uniform(0.95, 1.1))) if ret else None
